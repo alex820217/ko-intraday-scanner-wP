@@ -11,8 +11,64 @@ from market_universe import MARKET_GROUPS, build_universe
 from position_manager import load_positions, save_position, delete_position, close_position, load_history, evaluate_position
 from product_resolver import resolve_wkn, quote_age_minutes, freshness_label
 
+# Position mapping is deliberately independent from the current live scan.
+# Existing positions must remain selectable even if their cash market is closed.
+ASSET_ALIASES = {
+    "NVDA": ("nvidia", "nvidia corp", "nvidia corporation", "nvidia nasdaq"),
+    "MSFT": ("microsoft", "microsoft corp", "microsoft corporation"),
+    "AAPL": ("apple", "apple inc"),
+    "AMZN": ("amazon", "amazon.com"),
+    "META": ("meta", "meta platforms"),
+    "GOOGL": ("alphabet", "google"),
+    "TSLA": ("tesla", "tesla inc"),
+    "AMD": ("amd", "advanced micro devices"),
+    "AVGO": ("broadcom",),
+    "NFLX": ("netflix",),
+    "PLTR": ("palantir",),
+    "MU": ("micron",),
+    "QCOM": ("qualcomm",),
+    "INTC": ("intel",),
+    "ADBE": ("adobe",),
+    "CRM": ("salesforce",),
+    "^GDAXI": ("dax", "dax 40", "deutscher aktienindex"),
+    "^NDX": ("nasdaq 100", "nasdaq100", "ndx"),
+    "^GSPC": ("s&p 500", "sp 500", "s&p500"),
+    "GC=F": ("gold",),
+    "CL=F": ("wti", "wti oil", "crude oil"),
+    "EURUSD=X": ("eur/usd", "eurusd", "euro us dollar"),
+}
+
+def normalize_underlying(value):
+    import re
+    return " ".join(re.sub(r"[^a-z0-9&+/ ]+", " ", (value or "").lower()).split())
+
+def build_position_asset_options():
+    options = {}
+    for _group_name, group_assets in MARKET_GROUPS.items():
+        for asset_name, ticker_value in group_assets.items():
+            options[f"{asset_name} ({ticker_value})"] = ticker_value
+    return dict(sorted(options.items(), key=lambda item: item[0].casefold()))
+
+def auto_map_underlying(underlying, options):
+    needle = normalize_underlying(underlying)
+    ticker_to_label = {ticker: label for label, ticker in options.items()}
+    if not needle:
+        return None, None, 0.0, "Basiswertname fehlt"
+    for ticker, aliases in ASSET_ALIASES.items():
+        if ticker not in ticker_to_label:
+            continue
+        for alias in aliases:
+            alias_norm = normalize_underlying(alias)
+            if alias_norm in needle or needle in alias_norm:
+                return ticker_to_label[ticker], ticker, 1.0, f"Alias: {alias}"
+    for label, ticker in options.items():
+        asset_name = normalize_underlying(label.split(" (")[0])
+        if asset_name and (asset_name in needle or needle in asset_name):
+            return label, ticker, 0.95, "Namensübereinstimmung"
+    return None, None, 0.0, "keine eindeutige Zuordnung"
+
 st.set_page_config(page_title="KO Market Radar V3", page_icon="📡", layout="wide")
-st.title("📡 KO Market Radar V4.1")
+st.title("📡 KO Market Radar V4.1.1")
 st.caption("Market Radar plus vereinfachte WKN-Positionserfassung mit Geld/Brief, Quelle und Zeitstempel")
 
 MIN_15M_BARS = 210
@@ -271,8 +327,7 @@ st.divider()
 st.header("💼 Offene KO-Positionen")
 st.caption("Die WKN ist der Positionsschlüssel. Produktdaten werden nicht automatisch aus Scalable Capital gelesen; KO-Level, Ratio und Kaufdaten werden einmalig manuell übernommen.")
 
-available = scan[["Asset", "Ticker"]].drop_duplicates().sort_values("Asset")
-asset_options = {f"{x.Asset} ({x.Ticker})": x.Ticker for x in available.itertuples()}
+asset_options = build_position_asset_options()
 
 with st.expander("➕ Position mit WKN hinzufügen", expanded=False):
     st.write("Nur WKN, persönlicher Kaufpreis und Stückzahl eingeben. Öffentliche Produktdaten werden anschließend bestmöglich aufgelöst.")
@@ -319,10 +374,20 @@ with st.expander("➕ Position mit WKN hinzufügen", expanded=False):
         ])
         st.dataframe(details, hide_index=True, use_container_width=True)
 
-        # Automatische Zuordnung über Textähnlichkeit zu den aktuell gescannten Assets.
-        needle = (product.get("underlying") or "").lower()
-        matches = [label for label in asset_options if label.split(" (")[0].lower() in needle or needle in label.lower()]
-        automatic_asset = matches[0] if matches else None
+        # Basiswert automatisch gegen das vollständige Marktuniversum auflösen.
+        automatic_asset, automatic_ticker, mapping_confidence, mapping_reason = auto_map_underlying(
+            product.get("underlying"), asset_options
+        )
+        if automatic_asset:
+            st.success(
+                f"✅ Basiswert automatisch erkannt: {automatic_asset} "
+                f"({mapping_confidence:.0%}; {mapping_reason})"
+            )
+        else:
+            st.warning(
+                f"⚠️ Basiswert nicht automatisch erkannt: "
+                f"{product.get('underlying') or 'keine Angabe'}"
+            )
         missing_core = not product.get("direction") or product.get("ko_level") is None or not automatic_asset
         if missing_core:
             st.error("Die Kerndaten konnten nicht eindeutig zugeordnet werden. Bitte unten nur die fehlenden Felder bestätigen.")
@@ -332,7 +397,20 @@ with st.expander("➕ Position mit WKN hinzufügen", expanded=False):
             direction = x.selectbox("Richtung", ["LONG","SHORT"], index=0 if product.get("direction") != "SHORT" else 1)
             ko_level = y.number_input("KO-Level", min_value=0.000001, value=float(product.get("ko_level") or 0.000001), format="%.6f")
             ratio = z.number_input("Bezugsverhältnis", min_value=0.000001, value=float(product.get("ratio") or 0.01), format="%.6f")
-            underlying_entry = st.number_input("Basiswertkurs bei Kauf", min_value=0.000001, value=float(scan.loc[scan.Ticker == asset_options[selected_asset], "Kurs"].iloc[0]), format="%.6f")
+            selected_ticker = asset_options[selected_asset]
+            scan_match = scan.loc[scan.Ticker == selected_ticker, "Kurs"]
+            if not scan_match.empty:
+                default_underlying_entry = float(scan_match.iloc[0])
+            else:
+                try:
+                    fallback = download_one(selected_ticker, "15m", "5d")
+                    default_underlying_entry = float(fallback["Close"].iloc[-1]) if not fallback.empty else 1.0
+                except Exception:
+                    default_underlying_entry = 1.0
+            underlying_entry = st.number_input(
+                "Basiswertkurs bei Kauf", min_value=0.000001,
+                value=default_underlying_entry, format="%.6f"
+            )
             save = st.form_submit_button("Position übernehmen", type="primary")
         if save:
             save_position({
