@@ -13,14 +13,15 @@ from position_manager import load_positions, save_position, delete_position, clo
 from product_resolver import resolve_wkn, quote_age_minutes, freshness_label
 
 st.set_page_config(page_title="KO Market Radar V4.1 Early", page_icon="📡", layout="wide")
-st.title("📡 KO Market Radar V4.1 Early")
-st.caption("60m Regime + 15m Bias + 5m Setup + 3m Trigger, zweistufig und konfliktgefiltert")
 st.markdown("""<style>
-.block-container{max-width:1500px;padding-top:1.0rem;padding-bottom:3rem}
+.block-container{max-width:1500px;padding-top:2.35rem;padding-bottom:3rem}
 [data-testid="stMetric"]{background:#fff;border:1px solid #e6eaf0;padding:14px 16px;border-radius:16px;box-shadow:0 5px 18px rgba(15,23,42,.05)}
 div[data-testid="stDataFrame"],[data-testid="stExpander"]{border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;box-shadow:0 4px 16px rgba(15,23,42,.04)}
 h1,h2,h3{letter-spacing:-.025em}.small-label{color:#64748b;font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.signal-box{padding:14px 16px;border-radius:14px;background:#f8fafc;border:1px solid #e2e8f0;margin:.4rem 0 1rem}.sc-box{padding:14px 16px;border-radius:14px;background:#eef6ff;border:1px solid #cfe4ff;margin:.5rem 0 1rem}
 </style>""",unsafe_allow_html=True)
+st.markdown('<h1 style="margin:0 0 .25rem 0;font-size:2.45rem;line-height:1.15">📡 KO Market Radar V4.1 Early</h1>', unsafe_allow_html=True)
+st.caption("60m Regime + 15m Bias + 5m Setup + 3m Trigger, zweistufig und konfliktgefiltert")
+
 
 MIN_15M_BARS = 210
 MIN_5M_BARS = 60
