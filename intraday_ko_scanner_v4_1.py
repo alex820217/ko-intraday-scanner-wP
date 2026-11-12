@@ -3,6 +3,7 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
+import altair as alt
 import streamlit as st
 import ta
 import yfinance as yf
@@ -356,6 +357,40 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
     }, d15, d5, d3
 
 
+
+def trading_chart(df, timeframe_label, ema_cols, bars, levels=None, height=330):
+    """Readable intraday OHLC chart with candles, overlays and optional trade levels."""
+    d = df.tail(bars).copy().reset_index()
+    time_col = d.columns[0]
+    d = d.rename(columns={time_col:"Time"})
+    # Candle body must have a visible height even for very small bodies.
+    d["BodyLow"] = d[["Open","Close"]].min(axis=1)
+    d["BodyHigh"] = d[["Open","Close"]].max(axis=1)
+    d["Direction"] = np.where(d["Close"] >= d["Open"], "Up", "Down")
+    price_values = pd.concat([d["Low"], d["High"]]).dropna()
+    if price_values.empty:
+        st.info(f"Keine {timeframe_label}-Chartdaten verfügbar.")
+        return
+    pad = max((price_values.max()-price_values.min()) * 0.08, abs(price_values.iloc[-1]) * 0.001)
+    domain = [float(price_values.min()-pad), float(price_values.max()+pad)]
+    x = alt.X("Time:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelOverlap=True))
+    y = alt.Y("Low:Q", scale=alt.Scale(domain=domain, zero=False), axis=alt.Axis(title=None, format="~f"))
+    wicks = alt.Chart(d).mark_rule(strokeWidth=1).encode(x=x, y=y, y2="High:Q", color=alt.Color("Direction:N", scale=alt.Scale(domain=["Up","Down"], range=["#16a34a","#dc2626"]), legend=None))
+    bodies = alt.Chart(d).mark_bar(size=5).encode(x=x, y=alt.Y("BodyLow:Q", scale=alt.Scale(domain=domain, zero=False)), y2="BodyHigh:Q", color=alt.Color("Direction:N", scale=alt.Scale(domain=["Up","Down"], range=["#22c55e","#ef4444"]), legend=None), tooltip=[alt.Tooltip("Time:T"), "Open:Q","High:Q","Low:Q","Close:Q"])
+    layers = [wicks, bodies]
+    colors = {"EMA9":"#f59e0b", "EMA20":"#2563eb", "EMA50":"#8b5cf6", "EMA200":"#dc2626", "VWAP":"#0891b2"}
+    for col in ema_cols:
+        if col in d.columns:
+            layers.append(alt.Chart(d).mark_line(strokeWidth=1.6, color=colors.get(col,"#64748b")).encode(x=x, y=alt.Y(f"{col}:Q", scale=alt.Scale(domain=domain, zero=False)), tooltip=[alt.Tooltip(f"{col}:Q")]))
+    if levels:
+        level_colors = {"Entry":"#111827", "Stop":"#dc2626", "TP1":"#16a34a", "TP2":"#059669"}
+        for name, value in levels.items():
+            if value is not None and np.isfinite(value):
+                ld = pd.DataFrame({"Level":[float(value)], "Name":[name]})
+                layers.append(alt.Chart(ld).mark_rule(strokeDash=[6,4], strokeWidth=1.3, color=level_colors.get(name,"#111827")).encode(y=alt.Y("Level:Q", scale=alt.Scale(domain=domain, zero=False)), tooltip=["Name:N","Level:Q"]))
+    chart = alt.layer(*layers).properties(height=height).interactive(bind_y=False)
+    st.altair_chart(chart, use_container_width=True)
+
 st.sidebar.header("Marktuniversum")
 default_groups = ["Deutschland", "US Tech", "Indizes", "Metalle", "Energie", "Forex"]
 selected_groups = st.sidebar.multiselect("Marktgruppen", list(MARKET_GROUPS), default=default_groups)
@@ -459,16 +494,21 @@ if np.isfinite(r.Entry):
         col.metric(label,f"{r[label]:.4f}" if label not in {"CRV","KO Abstand %"} else f"{r[label]:.2f}")
 
 ticker=r.Ticker
-left,middle,right=st.columns(3)
-with left:
-    st.markdown("**3m · Entry Trigger**" if r["3m Trigger"] != "FALLBACK" else "**3m · 5m Fallback**")
-    st.line_chart(data3[ticker][["Close","EMA9","EMA20"]].tail(160))
-with middle:
-    st.markdown("**5m · Setup**")
-    st.line_chart(data5[ticker][["Close","EMA9","EMA20","VWAP"]].tail(160))
-with right:
-    st.markdown("**15m · Bias**")
-    st.line_chart(data15[ticker][["Close","EMA20","EMA50","EMA200","VWAP"]].tail(160))
+st.subheader("📈 Chartanalyse")
+chart_tab1,chart_tab2,chart_tab3 = st.tabs(["3m · Entry", "5m · Setup", "15m · Trend"])
+trade_levels = None
+if np.isfinite(r.Entry):
+    trade_levels = {"Entry":r.Entry, "Stop":r.Stop, "TP1":r["Ziel 1"], "TP2":r["Ziel 2"]}
+with chart_tab1:
+    if r["3m Trigger"] == "FALLBACK":
+        st.info("Für dieses Asset fehlen ausreichende 3m-Daten. Der Scanner verwendet den 5m-Fallback; EARLY ist damit gesperrt.")
+        trading_chart(data5[ticker], "5m Fallback", ["EMA9","EMA20"], 80, trade_levels)
+    else:
+        trading_chart(data3[ticker], "3m", ["EMA9","EMA20"], 90, trade_levels)
+with chart_tab2:
+    trading_chart(data5[ticker], "5m", ["EMA9","EMA20","VWAP"], 90, trade_levels)
+with chart_tab3:
+    trading_chart(data15[ticker], "15m", ["EMA20","EMA50","EMA200","VWAP"], 80, trade_levels)
 
 st.caption(f"Letzte 3m-Kerze: {r['Timestamp 3m']} | Letzte 5m-Kerze: {r['Timestamp 5m']} | Letzte 15m-Kerze: {r['Timestamp 15m']}")
 st.warning("V4.1 Early nutzt 60m Regime, 15m Bias, 5m Setup und 3m Trigger. 1m-Daten werden nur für plausible Kandidaten geladen. RSI über 72 im LONG bzw. unter 28 im SHORT blockiert neue Einstiege. 3m-Fallback erlaubt kein EARLY-Signal. KO-Level, Spread, Emittent, Bezugsverhältnis, Handelszeit und Event-Risiko vor einer manuellen Order prüfen.")
