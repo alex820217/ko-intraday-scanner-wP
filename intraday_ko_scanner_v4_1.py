@@ -8,6 +8,7 @@ import ta
 import yfinance as yf
 from decision_logic import SignalInput, decide_signal
 from market_universe import MARKET_GROUPS, build_universe
+from basiswert_ids import basiswert_meta
 from position_manager import load_positions, save_position, delete_position, close_position, load_history, evaluate_position
 from product_resolver import resolve_wkn, quote_age_minutes, freshness_label
 
@@ -208,6 +209,35 @@ def regime_60m_from_15m(raw15):
     regime = "LONG" if lc >= 3 and lc > sc else "SHORT" if sc >= 3 and sc > lc else "NEUTRAL"
     return regime, (long_checks if regime == "LONG" else short_checks if regime == "SHORT" else {**long_checks, **short_checks}), h1
 
+
+def grade_setup(signal, score, adx, extension_atr, rsi_entry, context_aligned, has_3m):
+    issues = []
+    trade_like = "EARLY" in signal or "CONFIRMED" in signal
+    if not context_aligned:
+        issues.append("60m/15m Kontext nicht ausgerichtet")
+    if not has_3m and "EARLY" in signal:
+        issues.append("3m Trigger fehlt")
+    if adx < 20:
+        issues.append(f"ADX nur {adx:.1f}")
+    if extension_atr > 0.75:
+        issues.append(f"Entry {extension_atr:.2f} ATR von EMA20")
+    if rsi_entry == "🟡 HEISS":
+        issues.append("RSI bereits heiß")
+    if "PRE" in signal:
+        issues.append("Entry-Trigger noch nicht vollständig")
+    if "WATCH" in signal:
+        issues.append("Setup noch unvollständig")
+    if "WAIT" in signal or "NO TRADE" in signal or "CONFLICT" in signal or "HOT ENTRY" in signal or "LATE ENTRY" in signal:
+        return "-", "; ".join(issues) if issues else "Kein handelbares Setup"
+    # Base grade from score, then cap based on quality defects.
+    grade = "A+" if score >= 90 else "A" if score >= 85 else "B" if score >= 75 else "C" if score >= 70 else "-"
+    if adx < 20 or extension_atr > 0.75 or rsi_entry == "🟡 HEISS":
+        grade = "B" if grade in {"A+", "A"} else grade
+    if len(issues) >= 2 and grade in {"A+", "A", "B"}:
+        grade = "C"
+    why = "A-Setup erfüllt" if grade in {"A+", "A"} and not issues else ("; ".join(issues) if issues else "Score unter A-Schwelle")
+    return grade, why
+
 def scan_asset(meta, spread_ok, event_risk, require_open):
     # Last row can still be forming, therefore only closed candles are evaluated.
     raw15 = download_one(meta["ticker"], "15m", "30d")
@@ -301,9 +331,12 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
     checks = {**regime_checks, **(bias_lc if preferred == "LONG" else bias_sc), **setup_checks, **trigger_checks,
               "Nicht zu spät": not late_entry, "RSI nicht überhitzt": not rsi_hot,
               "3m Daten verfügbar": has_3m, "Volatilität geeignet": volatility_ok}
+    setup_grade, why_not_a = grade_setup(signal, score, float(r15.ADX), extension_atr, rsi_entry_status, context_aligned, has_3m)
+    underlying_isin, sc_search = basiswert_meta(meta["ticker"], meta["name"], direction)
     return {
         "Gruppe":meta["group"], "Asset":meta["name"], "Ticker":meta["ticker"],
-        "Signal":signal, "Qualität":quality, "Score":score,
+        "Signal":signal, "Qualität":quality, "Score":score, "Setup Grade":setup_grade,
+        "Warum nicht A?":why_not_a, "Basiswert ISIN":underlying_isin, "SC Suche":sc_search,
         "Long":old_long, "Short":old_short, "60m Regime":regime60, "15m Bias":bias or "NEUTRAL",
         "5m Setup":f"{setup_count}/4", "3m Trigger":f"{trigger_count}/4" if has_3m else "FALLBACK",
         "Entry Status":entry_quality, "RSI Entry":rsi_entry_status, "EMA20 Dist. ATR":extension_atr,
@@ -363,7 +396,9 @@ if not rows:
 scan = pd.DataFrame(rows)
 priority = {"🟢 EARLY LONG":0,"🔴 EARLY SHORT":0,"🟢🟢 CONFIRMED LONG":0,"🔴🔴 CONFIRMED SHORT":0,"🟠 PRE-LONG":1,"🟠 PRE-SHORT":1,"🟡 WATCH LONG":2,"🟡 WATCH SHORT":2,"⚠️ CONTEXT CONFLICT":3,"⚪ WAIT":3,"⛔ HOT ENTRY":4,"⛔ LATE ENTRY":4,"⛔ NO TRADE":5}
 scan["Prio"] = scan.Signal.map(priority).fillna(9)
-scan = scan.sort_values(["Prio","Score","ADX"], ascending=[True,False,False])
+grade_rank = {"A+":0, "A":1, "B":2, "C":3, "-":9}
+scan["GradeRank"] = scan["Setup Grade"].map(grade_rank).fillna(9)
+scan = scan.sort_values(["Prio","GradeRank","Score","ADX"], ascending=[True,True,False,False])
 
 m = st.columns(6)
 m[0].metric("Scan aktiv",len(items)); m[1].metric("Analysiert",len(rows)); m[2].metric("Übersprungen",len(skipped_closed))
@@ -373,12 +408,12 @@ m[5].metric("Laufzeit",f"{time_module.time()-start:.1f}s")
 
 st.header("🔥 Top Market Radar")
 show = scan.head(top_n).copy()
-st.dataframe(show[["Gruppe","Asset","Ticker","Signal","Qualität","Score","60m Regime","15m Bias","5m Setup","3m Trigger","Entry Status","RSI Entry","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","Markt","Grund"]]
+st.dataframe(show[["Gruppe","Asset","Ticker","Basiswert ISIN","Signal","Setup Grade","Warum nicht A?","Score","60m Regime","15m Bias","5m Setup","3m Trigger","Entry Status","RSI Entry","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","SC Suche","Markt","Grund"]]
     .style.format({"EMA20 Dist. ATR":"{:.2f}","RSI":"{:.1f}","ADX":"{:.1f}","ATR %":"{:.2f}","CRV":"{:.2f}"}),
     use_container_width=True, hide_index=True)
 
 with st.expander("Alle analysierten Assets"):
-    st.dataframe(scan.drop(columns=["Prio","Checks"]), use_container_width=True, hide_index=True)
+    st.dataframe(scan.drop(columns=["Prio","GradeRank","Checks"]), use_container_width=True, hide_index=True)
 with st.expander(f"Geschlossene Märkte übersprungen ({len(skipped_closed)})"):
     if skipped_closed:
         st.dataframe(pd.DataFrame(skipped_closed), use_container_width=True, hide_index=True)
@@ -392,9 +427,10 @@ with st.expander(f"Nicht auswertbare Assets ({len(errors)})"):
 st.header("🔍 Setup-Details")
 selected = st.selectbox("Asset", scan.Asset.tolist())
 r = scan[scan.Asset == selected].iloc[0]
-c=st.columns(7)
-c[0].metric("Signal",r.Signal); c[1].metric("Qualität",r.Qualität); c[2].metric("Score",int(r.Score))
-c[3].metric("60m Regime",r["60m Regime"]); c[4].metric("15m Bias",r["15m Bias"]); c[5].metric("5m Setup",r["5m Setup"]); c[6].metric("3m Trigger",r["3m Trigger"])
+c=st.columns(8)
+c[0].metric("Signal",r.Signal); c[1].metric("Setup Grade",r["Setup Grade"]); c[2].metric("Score",int(r.Score))
+c[3].metric("60m Regime",r["60m Regime"]); c[4].metric("15m Bias",r["15m Bias"]); c[5].metric("5m Setup",r["5m Setup"]); c[6].metric("3m Trigger",r["3m Trigger"]); c[7].metric("Entry",r["Entry Status"])
+st.caption(f"Warum nicht A?: {r['Warum nicht A?']} | Basiswert-ISIN: {r['Basiswert ISIN'] or '–'} | SC Suche: {r['SC Suche']}")
 st.info(r.Grund)
 st.dataframe(pd.DataFrame([{"Kriterium":k,"Status":"✅" if v else "❌"} for k,v in r.Checks.items()]), hide_index=True, use_container_width=True)
 if np.isfinite(r.Entry):
