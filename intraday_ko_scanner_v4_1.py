@@ -11,68 +11,13 @@ from market_universe import MARKET_GROUPS, build_universe
 from position_manager import load_positions, save_position, delete_position, close_position, load_history, evaluate_position
 from product_resolver import resolve_wkn, quote_age_minutes, freshness_label
 
-# Position mapping is deliberately independent from the current live scan.
-# Existing positions must remain selectable even if their cash market is closed.
-ASSET_ALIASES = {
-    "NVDA": ("nvidia", "nvidia corp", "nvidia corporation", "nvidia nasdaq"),
-    "MSFT": ("microsoft", "microsoft corp", "microsoft corporation"),
-    "AAPL": ("apple", "apple inc"),
-    "AMZN": ("amazon", "amazon.com"),
-    "META": ("meta", "meta platforms"),
-    "GOOGL": ("alphabet", "google"),
-    "TSLA": ("tesla", "tesla inc"),
-    "AMD": ("amd", "advanced micro devices"),
-    "AVGO": ("broadcom",),
-    "NFLX": ("netflix",),
-    "PLTR": ("palantir",),
-    "MU": ("micron",),
-    "QCOM": ("qualcomm",),
-    "INTC": ("intel",),
-    "ADBE": ("adobe",),
-    "CRM": ("salesforce",),
-    "^GDAXI": ("dax", "dax 40", "deutscher aktienindex"),
-    "^NDX": ("nasdaq 100", "nasdaq100", "ndx"),
-    "^GSPC": ("s&p 500", "sp 500", "s&p500"),
-    "GC=F": ("gold",),
-    "CL=F": ("wti", "wti oil", "crude oil"),
-    "EURUSD=X": ("eur/usd", "eurusd", "euro us dollar"),
-}
-
-def normalize_underlying(value):
-    import re
-    return " ".join(re.sub(r"[^a-z0-9&+/ ]+", " ", (value or "").lower()).split())
-
-def build_position_asset_options():
-    options = {}
-    for _group_name, group_assets in MARKET_GROUPS.items():
-        for asset_name, ticker_value in group_assets.items():
-            options[f"{asset_name} ({ticker_value})"] = ticker_value
-    return dict(sorted(options.items(), key=lambda item: item[0].casefold()))
-
-def auto_map_underlying(underlying, options):
-    needle = normalize_underlying(underlying)
-    ticker_to_label = {ticker: label for label, ticker in options.items()}
-    if not needle:
-        return None, None, 0.0, "Basiswertname fehlt"
-    for ticker, aliases in ASSET_ALIASES.items():
-        if ticker not in ticker_to_label:
-            continue
-        for alias in aliases:
-            alias_norm = normalize_underlying(alias)
-            if alias_norm in needle or needle in alias_norm:
-                return ticker_to_label[ticker], ticker, 1.0, f"Alias: {alias}"
-    for label, ticker in options.items():
-        asset_name = normalize_underlying(label.split(" (")[0])
-        if asset_name and (asset_name in needle or needle in asset_name):
-            return label, ticker, 0.95, "Namensübereinstimmung"
-    return None, None, 0.0, "keine eindeutige Zuordnung"
-
-st.set_page_config(page_title="KO Market Radar V3", page_icon="📡", layout="wide")
-st.title("📡 KO Market Radar V4.1.1")
-st.caption("Market Radar plus vereinfachte WKN-Positionserfassung mit Geld/Brief, Quelle und Zeitstempel")
+st.set_page_config(page_title="KO Market Radar V4.1 Early", page_icon="📡", layout="wide")
+st.title("📡 KO Market Radar V4.1 Early")
+st.caption("15m Bias + 5m Setup + 3m Entry-Trigger mit EARLY, CONFIRMED und LATE-ENTRY-Filter")
 
 MIN_15M_BARS = 210
 MIN_5M_BARS = 60
+MIN_3M_BARS = 80
 
 
 def series(frame, column):
@@ -92,6 +37,17 @@ def download_one(ticker, interval, period):
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         out[col] = series(data, col)
     return out.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def download_three_minute(ticker):
+    """Yahoo has no native 3m interval. Build confirmed 3m candles from 1m data."""
+    raw = download_one(ticker, "1m", "7d")
+    if raw.empty:
+        return raw
+    agg = {"Open":"first", "High":"max", "Low":"min", "Close":"last", "Volume":"sum"}
+    bars = raw.resample("3min", origin="start_day", label="right", closed="right").agg(agg)
+    return bars.dropna(subset=["Open", "High", "Low", "Close"])
 
 
 def market_open(ticker):
@@ -163,62 +119,143 @@ def timing_5m(d, direction):
     return checks, sum(checks.values())
 
 
-def scan_asset(meta, spread_ok, event_risk, require_open):
-    d15 = add_indicators(download_one(meta["ticker"], "15m", "30d")).dropna()
-    d5 = add_indicators(download_one(meta["ticker"], "5m", "5d")).dropna()
-    if len(d15) < MIN_15M_BARS or len(d5) < MIN_5M_BARS:
-        raise ValueError(f"zu wenige Daten (15m={len(d15)}, 5m={len(d5)})")
 
-    ls, ss, lc, sc = score_15m(d15)
-    preferred = "LONG" if ls >= ss else "SHORT"
-    t5, timing_count = timing_5m(d5, preferred)
-    # Entry Timing: bis zu 10 zusätzliche Punkte, READY benötigt mindestens 3/4 Timing-Bedingungen.
-    adjusted_long = min(100, ls + (timing_count * 2 if preferred == "LONG" else 0))
-    adjusted_short = min(100, ss + (timing_count * 2 if preferred == "SHORT" else 0))
-
-    r, p = d15.iloc[-1], d15.iloc[-2]
-    price, atr = float(r.Close), float(r.ATR)
-    stop = price - 1.2*atr if preferred == "LONG" else price + 1.2*atr
-    target1 = price + 1.8*abs(price-stop) if preferred == "LONG" else price - 1.8*abs(price-stop)
-    rr = abs(target1-price)/abs(price-stop)
-    is_open = market_open(meta["ticker"])
-    decision = decide_signal(SignalInput(
-        price=price, prev_close=float(p.Close), ema20=float(r.EMA20), ema50=float(r.EMA50),
-        ema200=float(r.EMA200), prev_ema20=float(p.EMA20), rsi=float(r.RSI),
-        macd_hist=float(r.MACD_HIST), adx=float(r.ADX), vwap=float(r.VWAP), atr=atr,
-        long_score=adjusted_long, short_score=adjusted_short, rr=rr,
-        market_open=(is_open or not require_open), data_fresh=True, confirmed_bar=True,
-        spread_ok=spread_ok, event_risk=event_risk,
-        volatility_ok=0.05 <= atr/price*100 <= 5.0,
-    ))
-
-    # READY wird auf WATCH zurückgestuft, falls das 5m Timing noch nicht bestätigt ist.
-    if decision["signal"] in {"🟢 READY LONG", "🔴 READY SHORT"} and timing_count < 3:
-        decision["signal"] = "🟡 WATCH " + decision["direction"]
-        decision["quality"] = "WATCH"
-        decision["reason"] = "15m Setup gültig, 5m Entry-Timing noch nicht bestätigt"
-
-    direction = decision["direction"]
+def trigger_3m(d, direction):
+    r, p = d.iloc[-1], d.iloc[-2]
     if direction == "LONG":
-        stop, t1, t2, ko = price-1.2*atr, price+2.16*atr, price+3.36*atr, price-1.7*atr
+        checks = {
+            "3m Kurs > EMA9": r.Close > r.EMA9,
+            "3m EMA9 > EMA20": r.EMA9 > r.EMA20,
+            "3m RSI > 52": r.RSI > 52,
+            "3m Hoch-Ausbruch": r.Close > p.High,
+        }
+    else:
+        checks = {
+            "3m Kurs < EMA9": r.Close < r.EMA9,
+            "3m EMA9 < EMA20": r.EMA9 < r.EMA20,
+            "3m RSI < 48": r.RSI < 48,
+            "3m Tief-Ausbruch": r.Close < p.Low,
+        }
+    return checks, sum(bool(v) for v in checks.values())
+
+
+def setup_5m(d, direction):
+    r = d.iloc[-1]
+    if direction == "LONG":
+        checks = {
+            "5m Kurs > VWAP": r.Close > r.VWAP,
+            "5m EMA9 > EMA20": r.EMA9 > r.EMA20,
+            "5m RSI > 50": r.RSI > 50,
+            "5m MACD positiv": r.MACD_HIST > 0,
+        }
+    else:
+        checks = {
+            "5m Kurs < VWAP": r.Close < r.VWAP,
+            "5m EMA9 < EMA20": r.EMA9 < r.EMA20,
+            "5m RSI < 50": r.RSI < 50,
+            "5m MACD negativ": r.MACD_HIST < 0,
+        }
+    return checks, sum(bool(v) for v in checks.values())
+
+
+def bias_15m(d):
+    r = d.iloc[-1]
+    long_checks = {
+        "15m Kurs > EMA20": r.Close > r.EMA20,
+        "15m EMA20 > EMA50": r.EMA20 > r.EMA50,
+        "15m EMA50 > EMA200": r.EMA50 > r.EMA200,
+        "15m ADX >= 18": r.ADX >= 18,
+        "15m MACD positiv": r.MACD_HIST > 0,
+    }
+    short_checks = {
+        "15m Kurs < EMA20": r.Close < r.EMA20,
+        "15m EMA20 < EMA50": r.EMA20 < r.EMA50,
+        "15m EMA50 < EMA200": r.EMA50 < r.EMA200,
+        "15m ADX >= 18": r.ADX >= 18,
+        "15m MACD negativ": r.MACD_HIST < 0,
+    }
+    long_count = sum(bool(v) for v in long_checks.values())
+    short_count = sum(bool(v) for v in short_checks.values())
+    direction = "LONG" if long_count >= 4 and long_count > short_count else "SHORT" if short_count >= 4 and short_count > long_count else None
+    return direction, long_checks, short_checks, long_count, short_count
+
+def scan_asset(meta, spread_ok, event_risk, require_open):
+    # Last row can still be forming, therefore only closed candles are evaluated.
+    raw15 = download_one(meta["ticker"], "15m", "30d")
+    raw5 = download_one(meta["ticker"], "5m", "5d")
+    raw3 = download_three_minute(meta["ticker"])
+    d15 = add_indicators(raw15.iloc[:-1]).dropna()
+    d5 = add_indicators(raw5.iloc[:-1]).dropna()
+    d3 = add_indicators(raw3.iloc[:-1]).dropna()
+    if len(d15) < MIN_15M_BARS or len(d5) < MIN_5M_BARS or len(d3) < MIN_3M_BARS:
+        raise ValueError(f"zu wenige Daten (15m={len(d15)}, 5m={len(d5)}, 3m={len(d3)})")
+
+    old_long, old_short, old_lc, old_sc = score_15m(d15)
+    bias, bias_lc, bias_sc, bias_long_count, bias_short_count = bias_15m(d15)
+    preferred = bias or ("LONG" if old_long >= old_short else "SHORT")
+    setup_checks, setup_count = setup_5m(d5, preferred)
+    trigger_checks, trigger_count = trigger_3m(d3, preferred)
+
+    r15, r5, r3 = d15.iloc[-1], d5.iloc[-1], d3.iloc[-1]
+    price = float(r3.Close)
+    atr = float(r5.ATR)
+    atr_pct = atr / price * 100 if price else 0
+    extension_atr = abs(float(r5.Close) - float(r5.EMA20)) / float(r5.ATR) if float(r5.ATR) > 0 else np.inf
+    late_entry = extension_atr > 1.0
+    volatility_ok = 0.05 <= atr_pct <= 5.0
+    is_open = market_open(meta["ticker"])
+    no_trade_reasons = []
+    if require_open and not is_open: no_trade_reasons.append("Markt geschlossen")
+    if not spread_ok: no_trade_reasons.append("KO-Spread nicht akzeptabel")
+    if event_risk: no_trade_reasons.append("Event-Risiko aktiv")
+    if not volatility_ok: no_trade_reasons.append("Volatilität ungeeignet")
+
+    bias_points = (bias_long_count if preferred == "LONG" else bias_short_count) * 8
+    setup_points = setup_count * 7
+    trigger_points = trigger_count * 7
+    score = min(100, bias_points + setup_points + trigger_points)
+    confirmed_old = (old_long >= 80 and all(old_lc.values())) if preferred == "LONG" else (old_short >= 80 and all(old_sc.values()))
+
+    if no_trade_reasons:
+        signal, quality, reason, direction = "⛔ NO TRADE", "BLOCKED", "; ".join(no_trade_reasons), None
+    elif late_entry and bias and setup_count >= 3 and trigger_count >= 3:
+        signal, quality, reason, direction = "⛔ LATE ENTRY", "WAIT PULLBACK", f"Bewegung bereits {extension_atr:.2f} ATR von EMA20 entfernt", preferred
+    elif bias and confirmed_old and setup_count >= 3 and trigger_count >= 3 and score >= 80:
+        signal = "🟢🟢 CONFIRMED LONG" if preferred == "LONG" else "🔴🔴 CONFIRMED SHORT"
+        quality, reason, direction = "A" if score < 90 else "A+", "15m, 5m und 3m vollständig bestätigt", preferred
+    elif bias and setup_count >= 3 and trigger_count >= 3 and score >= 70:
+        signal = "🟢 EARLY LONG" if preferred == "LONG" else "🔴 EARLY SHORT"
+        quality, reason, direction = "EARLY", "15m Bias, 5m Setup und 3m Trigger bestätigt", preferred
+    elif bias and setup_count >= 3:
+        signal = "🟠 PRE-LONG" if preferred == "LONG" else "🟠 PRE-SHORT"
+        quality, reason, direction = "PRE", f"3m Trigger erst {trigger_count}/4", preferred
+    elif bias:
+        signal = "🟡 WATCH LONG" if preferred == "LONG" else "🟡 WATCH SHORT"
+        quality, reason, direction = "WATCH", f"5m Setup erst {setup_count}/4", preferred
+    else:
+        signal, quality, reason, direction = "⚪ WAIT", "NEUTRAL", "Kein eindeutiger 15m Bias", None
+
+    if direction == "LONG":
+        stop, t1, t2, ko = price - 1.2*atr, price + 2.16*atr, price + 3.36*atr, price - 1.7*atr
     elif direction == "SHORT":
-        stop, t1, t2, ko = price+1.2*atr, price-2.16*atr, price-3.36*atr, price+1.7*atr
+        stop, t1, t2, ko = price + 1.2*atr, price - 2.16*atr, price - 3.36*atr, price + 1.7*atr
     else:
         stop=t1=t2=ko=np.nan
-
-    checks = lc if direction == "LONG" else sc if direction == "SHORT" else (lc if ls >= ss else sc)
-    checks = {**checks, **t5}
+    checks = {**(bias_lc if preferred == "LONG" else bias_sc), **setup_checks, **trigger_checks,
+              "Nicht zu spät": not late_entry, "Volatilität geeignet": volatility_ok}
     return {
         "Gruppe":meta["group"], "Asset":meta["name"], "Ticker":meta["ticker"],
-        "Signal":decision["signal"], "Qualität":decision["quality"], "Score":decision["score"],
-        "Long":adjusted_long, "Short":adjusted_short, "5m Timing":f"{timing_count}/4",
-        "Kurs":price, "RSI":float(r.RSI), "ADX":float(r.ADX), "ATR %":atr/price*100,
-        "Markt":"🟢 Offen" if is_open else "🔴 Geschlossen", "Grund":decision["reason"],
+        "Signal":signal, "Qualität":quality, "Score":score,
+        "Long":old_long, "Short":old_short, "15m Bias":bias or "NEUTRAL",
+        "5m Setup":f"{setup_count}/4", "3m Trigger":f"{trigger_count}/4",
+        "Entry Status":"⛔ SPÄT" if late_entry else "✅ OK", "EMA20 Dist. ATR":extension_atr,
+        "Kurs":price, "RSI":float(r15.RSI), "ADX":float(r15.ADX), "ATR %":atr_pct,
+        "Markt":"🟢 Offen" if is_open else "🔴 Geschlossen", "Grund":reason,
         "Entry":price if direction in {"LONG","SHORT"} else np.nan, "Stop":stop,
-        "Ziel 1":t1, "Ziel 2":t2, "CRV":rr if direction in {"LONG","SHORT"} else np.nan,
+        "Ziel 1":t1, "Ziel 2":t2, "CRV":1.8 if direction in {"LONG","SHORT"} else np.nan,
         "KO Referenz":ko, "KO Abstand %":abs(price-ko)/price*100 if np.isfinite(ko) else np.nan,
-        "Checks":checks, "Timestamp 15m":d15.index[-1], "Timestamp 5m":d5.index[-1],
-    }, d15, d5
+        "Checks":checks, "Timestamp 15m":d15.index[-1], "Timestamp 5m":d5.index[-1], "Timestamp 3m":d3.index[-1],
+    }, d15, d5, d3
 
 
 st.sidebar.header("Marktuniversum")
@@ -248,13 +285,13 @@ if st.sidebar.button("Cache leeren und neu scannen"):
 
 progress = st.progress(0, text="Scan wird vorbereitet …")
 status = st.empty()
-rows, data15, data5, errors = [], {}, {}, []
+rows, data15, data5, data3, errors = [], {}, {}, {}, []
 start = time_module.time()
 for n, meta in enumerate(items, start=1):
     status.info(f"Prüfe {n}/{len(items)}: {meta['name']} ({meta['ticker']})")
     try:
-        row, d15, d5 = scan_asset(meta, spread_ok, event_risk, require_open)
-        rows.append(row); data15[meta["ticker"]]=d15; data5[meta["ticker"]]=d5
+        row, d15, d5, d3 = scan_asset(meta, spread_ok, event_risk, require_open)
+        rows.append(row); data15[meta["ticker"]]=d15; data5[meta["ticker"]]=d5; data3[meta["ticker"]]=d3
     except Exception as exc:
         errors.append({"Asset":meta["name"], "Ticker":meta["ticker"], "Fehler":str(exc)})
     progress.progress(n/len(items), text=f"{n}/{len(items)} Assets geprüft")
@@ -266,20 +303,20 @@ if not rows:
     st.stop()
 
 scan = pd.DataFrame(rows)
-priority = {"🟢 READY LONG":0,"🔴 READY SHORT":0,"🟡 WATCH LONG":1,"🟡 WATCH SHORT":1,"⚪ WAIT":2,"⛔ NO TRADE":3}
+priority = {"🟢 EARLY LONG":0,"🔴 EARLY SHORT":0,"🟢🟢 CONFIRMED LONG":0,"🔴🔴 CONFIRMED SHORT":0,"🟠 PRE-LONG":1,"🟠 PRE-SHORT":1,"🟡 WATCH LONG":2,"🟡 WATCH SHORT":2,"⚪ WAIT":3,"⛔ LATE ENTRY":4,"⛔ NO TRADE":5}
 scan["Prio"] = scan.Signal.map(priority).fillna(9)
 scan = scan.sort_values(["Prio","Score","ADX"], ascending=[True,False,False])
 
 m = st.columns(6)
 m[0].metric("Scan aktiv",len(items)); m[1].metric("Analysiert",len(rows)); m[2].metric("Übersprungen",len(skipped_closed))
-m[3].metric("READY",int(scan.Signal.str.contains("READY").sum()))
-m[4].metric("WATCH",int(scan.Signal.str.contains("WATCH").sum()))
+m[3].metric("TRADE",int(scan.Signal.str.contains("EARLY|CONFIRMED", regex=True).sum()))
+m[4].metric("PRE/WATCH",int(scan.Signal.str.contains("PRE|WATCH", regex=True).sum()))
 m[5].metric("Laufzeit",f"{time_module.time()-start:.1f}s")
 
 st.header("🔥 Top Market Radar")
 show = scan.head(top_n).copy()
-st.dataframe(show[["Gruppe","Asset","Ticker","Signal","Qualität","Score","Long","Short","5m Timing","RSI","ADX","ATR %","CRV","Markt","Grund"]]
-    .style.format({"RSI":"{:.1f}","ADX":"{:.1f}","ATR %":"{:.2f}","CRV":"{:.2f}"}),
+st.dataframe(show[["Gruppe","Asset","Ticker","Signal","Qualität","Score","15m Bias","5m Setup","3m Trigger","Entry Status","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","Markt","Grund"]]
+    .style.format({"EMA20 Dist. ATR":"{:.2f}","RSI":"{:.1f}","ADX":"{:.1f}","ATR %":"{:.2f}","CRV":"{:.2f}"}),
     use_container_width=True, hide_index=True)
 
 with st.expander("Alle analysierten Assets"):
@@ -299,7 +336,7 @@ selected = st.selectbox("Asset", scan.Asset.tolist())
 r = scan[scan.Asset == selected].iloc[0]
 c=st.columns(6)
 c[0].metric("Signal",r.Signal); c[1].metric("Qualität",r.Qualität); c[2].metric("Score",int(r.Score))
-c[3].metric("5m Timing",r["5m Timing"]); c[4].metric("Long",int(r.Long)); c[5].metric("Short",int(r.Short))
+c[3].metric("15m Bias",r["15m Bias"]); c[4].metric("5m Setup",r["5m Setup"]); c[5].metric("3m Trigger",r["3m Trigger"])
 st.info(r.Grund)
 st.dataframe(pd.DataFrame([{"Kriterium":k,"Status":"✅" if v else "❌"} for k,v in r.Checks.items()]), hide_index=True, use_container_width=True)
 if np.isfinite(r.Entry):
@@ -308,16 +345,19 @@ if np.isfinite(r.Entry):
         col.metric(label,f"{r[label]:.4f}" if label not in {"CRV","KO Abstand %"} else f"{r[label]:.2f}")
 
 ticker=r.Ticker
-left,right=st.columns(2)
+left,middle,right=st.columns(3)
 with left:
-    st.subheader("5-Minuten Entry-Timing")
+    st.subheader("3-Minuten Entry-Trigger")
+    st.line_chart(data3[ticker][["Close","EMA9","EMA20"]].tail(160))
+with middle:
+    st.subheader("5-Minuten Setup")
     st.line_chart(data5[ticker][["Close","EMA9","EMA20","VWAP"]].tail(160))
 with right:
-    st.subheader("15-Minuten Trendbestätigung")
+    st.subheader("15-Minuten Bias")
     st.line_chart(data15[ticker][["Close","EMA20","EMA50","EMA200","VWAP"]].tail(160))
 
-st.caption(f"Letzte 5m-Kerze: {r['Timestamp 5m']} | Letzte 15m-Kerze: {r['Timestamp 15m']}")
-st.warning("V3 scannt ein breites, aber bewusst liquides Universum und nicht jede weltweit notierte Aktie. READY ist nur ein Kandidat. KO-Level, Spread, Emittent, Bezugsverhältnis, Handelszeit und Event-Risiko vor einer manuellen Order prüfen.")
+st.caption(f"Letzte 3m-Kerze: {r['Timestamp 3m']} | Letzte 5m-Kerze: {r['Timestamp 5m']} | Letzte 15m-Kerze: {r['Timestamp 15m']}")
+st.warning("V4.1 Early nutzt 15m Bias, 5m Setup und 3m Trigger. EARLY und CONFIRMED sind nur technische Kandidaten; LATE ENTRY verlangt einen Pullback. KO-Level, Spread, Emittent, Bezugsverhältnis, Handelszeit und Event-Risiko vor einer manuellen Order prüfen.")
 
 
 # ================================================================
@@ -327,7 +367,12 @@ st.divider()
 st.header("💼 Offene KO-Positionen")
 st.caption("Die WKN ist der Positionsschlüssel. Produktdaten werden nicht automatisch aus Scalable Capital gelesen; KO-Level, Ratio und Kaufdaten werden einmalig manuell übernommen.")
 
-asset_options = build_position_asset_options()
+# Position mapping always uses the complete configured universe, even when a market is closed.
+asset_options = {}
+for _group_name, _group_assets in MARKET_GROUPS.items():
+    for _asset_name, _ticker_value in _group_assets.items():
+        asset_options[f"{_asset_name} ({_ticker_value})"] = _ticker_value
+asset_options = dict(sorted(asset_options.items(), key=lambda item: item[0].casefold()))
 
 with st.expander("➕ Position mit WKN hinzufügen", expanded=False):
     st.write("Nur WKN, persönlicher Kaufpreis und Stückzahl eingeben. Öffentliche Produktdaten werden anschließend bestmöglich aufgelöst.")
@@ -374,20 +419,21 @@ with st.expander("➕ Position mit WKN hinzufügen", expanded=False):
         ])
         st.dataframe(details, hide_index=True, use_container_width=True)
 
-        # Basiswert automatisch gegen das vollständige Marktuniversum auflösen.
-        automatic_asset, automatic_ticker, mapping_confidence, mapping_reason = auto_map_underlying(
-            product.get("underlying"), asset_options
-        )
+        # Normalize common product names, e.g. "Nvidia Nasdaq ..." -> NVDA.
+        needle = (product.get("underlying") or "").lower()
+        aliases = {
+            "nvidia": "NVDA", "microsoft": "MSFT", "apple": "AAPL",
+            "amazon": "AMZN", "tesla": "TSLA", "amd": "AMD",
+            "dax": "^GDAXI", "nasdaq 100": "^NDX", "gold": "GC=F",
+            "eur/usd": "EURUSD=X", "wti": "CL=F",
+        }
+        target_ticker = next((ticker for alias, ticker in aliases.items() if alias in needle), None)
+        automatic_asset = next((label for label, ticker in asset_options.items() if ticker == target_ticker), None)
+        if not automatic_asset:
+            matches = [label for label in asset_options if label.split(" (")[0].lower() in needle]
+            automatic_asset = matches[0] if matches else None
         if automatic_asset:
-            st.success(
-                f"✅ Basiswert automatisch erkannt: {automatic_asset} "
-                f"({mapping_confidence:.0%}; {mapping_reason})"
-            )
-        else:
-            st.warning(
-                f"⚠️ Basiswert nicht automatisch erkannt: "
-                f"{product.get('underlying') or 'keine Angabe'}"
-            )
+            st.success(f"✅ Basiswert automatisch erkannt: {automatic_asset}")
         missing_core = not product.get("direction") or product.get("ko_level") is None or not automatic_asset
         if missing_core:
             st.error("Die Kerndaten konnten nicht eindeutig zugeordnet werden. Bitte unten nur die fehlenden Felder bestätigen.")
@@ -398,19 +444,16 @@ with st.expander("➕ Position mit WKN hinzufügen", expanded=False):
             ko_level = y.number_input("KO-Level", min_value=0.000001, value=float(product.get("ko_level") or 0.000001), format="%.6f")
             ratio = z.number_input("Bezugsverhältnis", min_value=0.000001, value=float(product.get("ratio") or 0.01), format="%.6f")
             selected_ticker = asset_options[selected_asset]
-            scan_match = scan.loc[scan.Ticker == selected_ticker, "Kurs"]
-            if not scan_match.empty:
-                default_underlying_entry = float(scan_match.iloc[0])
+            _match = scan.loc[scan.Ticker == selected_ticker, "Kurs"]
+            if not _match.empty:
+                _default_underlying = float(_match.iloc[0])
             else:
                 try:
-                    fallback = download_one(selected_ticker, "15m", "5d")
-                    default_underlying_entry = float(fallback["Close"].iloc[-1]) if not fallback.empty else 1.0
+                    _fallback = download_one(selected_ticker, "15m", "5d")
+                    _default_underlying = float(_fallback["Close"].iloc[-1]) if not _fallback.empty else 1.0
                 except Exception:
-                    default_underlying_entry = 1.0
-            underlying_entry = st.number_input(
-                "Basiswertkurs bei Kauf", min_value=0.000001,
-                value=default_underlying_entry, format="%.6f"
-            )
+                    _default_underlying = 1.0
+            underlying_entry = st.number_input("Basiswertkurs bei Kauf", min_value=0.000001, value=_default_underlying, format="%.6f")
             save = st.form_submit_button("Position übernehmen", type="primary")
         if save:
             save_position({
