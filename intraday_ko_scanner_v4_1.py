@@ -186,22 +186,36 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
     raw3 = download_three_minute(meta["ticker"])
     d15 = add_indicators(raw15.iloc[:-1]).dropna()
     d5 = add_indicators(raw5.iloc[:-1]).dropna()
-    d3 = add_indicators(raw3.iloc[:-1]).dropna()
-    if len(d15) < MIN_15M_BARS or len(d5) < MIN_5M_BARS or len(d3) < MIN_3M_BARS:
-        raise ValueError(f"zu wenige Daten (15m={len(d15)}, 5m={len(d5)}, 3m={len(d3)})")
+    d3_candidate = add_indicators(raw3.iloc[:-1]).dropna() if not raw3.empty else pd.DataFrame()
+    if len(d15) < MIN_15M_BARS or len(d5) < MIN_5M_BARS:
+        raise ValueError(f"zu wenige Basisdaten (15m={len(d15)}, 5m={len(d5)})")
+    has_3m = len(d3_candidate) >= MIN_3M_BARS
+    # Fallback keeps the asset analyzable. It can produce WATCH/PRE and strict CONFIRMED,
+    # but never EARLY without a genuine 3m trigger.
+    d3 = d3_candidate if has_3m else d5.copy()
 
     old_long, old_short, old_lc, old_sc = score_15m(d15)
     bias, bias_lc, bias_sc, bias_long_count, bias_short_count = bias_15m(d15)
     preferred = bias or ("LONG" if old_long >= old_short else "SHORT")
     setup_checks, setup_count = setup_5m(d5, preferred)
-    trigger_checks, trigger_count = trigger_3m(d3, preferred)
+    if has_3m:
+        trigger_checks, trigger_count = trigger_3m(d3, preferred)
+    else:
+        trigger_checks = {"3m Daten verfügbar": False}
+        trigger_count = 0
 
-    r15, r5, r3 = d15.iloc[-1], d5.iloc[-1], d3.iloc[-1]
-    price = float(r3.Close)
+    r15, r5 = d15.iloc[-1], d5.iloc[-1]
+    r3 = d3.iloc[-1]
+    price = float(r3.Close) if has_3m else float(r5.Close)
     atr = float(r5.ATR)
     atr_pct = atr / price * 100 if price else 0
     extension_atr = abs(float(r5.Close) - float(r5.EMA20)) / float(r5.ATR) if float(r5.ATR) > 0 else np.inf
+    entry_quality = "🟢 OPTIMAL" if extension_atr <= 0.75 else "🟡 AKZEPTABEL" if extension_atr <= 1.0 else "🔴 SPÄT"
     late_entry = extension_atr > 1.0
+    rsi15 = float(r15.RSI)
+    rsi_hot = (preferred == "LONG" and rsi15 > 72) or (preferred == "SHORT" and rsi15 < 28)
+    rsi_warm = (preferred == "LONG" and 68 < rsi15 <= 72) or (preferred == "SHORT" and 28 <= rsi15 < 32)
+    rsi_entry_status = "🔴 ÜBERHITZT" if rsi_hot else "🟡 HEISS" if rsi_warm else "🟢 NORMAL"
     volatility_ok = 0.05 <= atr_pct <= 5.0
     is_open = market_open(meta["ticker"])
     no_trade_reasons = []
@@ -218,17 +232,23 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
 
     if no_trade_reasons:
         signal, quality, reason, direction = "⛔ NO TRADE", "BLOCKED", "; ".join(no_trade_reasons), None
-    elif late_entry and bias and setup_count >= 3 and trigger_count >= 3:
+    elif rsi_hot and bias and setup_count >= 3:
+        signal, quality, reason, direction = "⛔ HOT ENTRY", "WAIT PULLBACK", f"RSI {rsi15:.1f} ist für einen neuen {preferred}-Einstieg überhitzt", preferred
+    elif late_entry and bias and setup_count >= 3:
         signal, quality, reason, direction = "⛔ LATE ENTRY", "WAIT PULLBACK", f"Bewegung bereits {extension_atr:.2f} ATR von EMA20 entfernt", preferred
-    elif bias and confirmed_old and setup_count >= 3 and trigger_count >= 3 and score >= 80:
+    elif bias and confirmed_old and setup_count >= 3 and ((has_3m and trigger_count >= 3) or not has_3m) and score >= 80:
         signal = "🟢🟢 CONFIRMED LONG" if preferred == "LONG" else "🔴🔴 CONFIRMED SHORT"
-        quality, reason, direction = "A" if score < 90 else "A+", "15m, 5m und 3m vollständig bestätigt", preferred
-    elif bias and setup_count >= 3 and trigger_count >= 3 and score >= 70:
+        quality = "A" if score < 90 else "A+"
+        reason = "15m und 5m streng bestätigt; 3m-Fallback aktiv" if not has_3m else "15m, 5m und 3m vollständig bestätigt"
+        direction = preferred
+    elif has_3m and bias and setup_count >= 3 and trigger_count >= 3 and score >= 70:
         signal = "🟢 EARLY LONG" if preferred == "LONG" else "🔴 EARLY SHORT"
         quality, reason, direction = "EARLY", "15m Bias, 5m Setup und 3m Trigger bestätigt", preferred
     elif bias and setup_count >= 3:
         signal = "🟠 PRE-LONG" if preferred == "LONG" else "🟠 PRE-SHORT"
-        quality, reason, direction = "PRE", f"3m Trigger erst {trigger_count}/4", preferred
+        quality = "PRE"
+        reason = f"3m Trigger erst {trigger_count}/4" if has_3m else "3m nicht verfügbar; 5m/15m-Fallback aktiv"
+        direction = preferred
     elif bias:
         signal = "🟡 WATCH LONG" if preferred == "LONG" else "🟡 WATCH SHORT"
         quality, reason, direction = "WATCH", f"5m Setup erst {setup_count}/4", preferred
@@ -242,13 +262,14 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
     else:
         stop=t1=t2=ko=np.nan
     checks = {**(bias_lc if preferred == "LONG" else bias_sc), **setup_checks, **trigger_checks,
-              "Nicht zu spät": not late_entry, "Volatilität geeignet": volatility_ok}
+              "Nicht zu spät": not late_entry, "RSI nicht überhitzt": not rsi_hot,
+              "3m Daten verfügbar": has_3m, "Volatilität geeignet": volatility_ok}
     return {
         "Gruppe":meta["group"], "Asset":meta["name"], "Ticker":meta["ticker"],
         "Signal":signal, "Qualität":quality, "Score":score,
         "Long":old_long, "Short":old_short, "15m Bias":bias or "NEUTRAL",
-        "5m Setup":f"{setup_count}/4", "3m Trigger":f"{trigger_count}/4",
-        "Entry Status":"⛔ SPÄT" if late_entry else "✅ OK", "EMA20 Dist. ATR":extension_atr,
+        "5m Setup":f"{setup_count}/4", "3m Trigger":f"{trigger_count}/4" if has_3m else "FALLBACK",
+        "Entry Status":entry_quality, "RSI Entry":rsi_entry_status, "EMA20 Dist. ATR":extension_atr,
         "Kurs":price, "RSI":float(r15.RSI), "ADX":float(r15.ADX), "ATR %":atr_pct,
         "Markt":"🟢 Offen" if is_open else "🔴 Geschlossen", "Grund":reason,
         "Entry":price if direction in {"LONG","SHORT"} else np.nan, "Stop":stop,
@@ -303,7 +324,7 @@ if not rows:
     st.stop()
 
 scan = pd.DataFrame(rows)
-priority = {"🟢 EARLY LONG":0,"🔴 EARLY SHORT":0,"🟢🟢 CONFIRMED LONG":0,"🔴🔴 CONFIRMED SHORT":0,"🟠 PRE-LONG":1,"🟠 PRE-SHORT":1,"🟡 WATCH LONG":2,"🟡 WATCH SHORT":2,"⚪ WAIT":3,"⛔ LATE ENTRY":4,"⛔ NO TRADE":5}
+priority = {"🟢 EARLY LONG":0,"🔴 EARLY SHORT":0,"🟢🟢 CONFIRMED LONG":0,"🔴🔴 CONFIRMED SHORT":0,"🟠 PRE-LONG":1,"🟠 PRE-SHORT":1,"🟡 WATCH LONG":2,"🟡 WATCH SHORT":2,"⚪ WAIT":3,"⛔ HOT ENTRY":4,"⛔ LATE ENTRY":4,"⛔ NO TRADE":5}
 scan["Prio"] = scan.Signal.map(priority).fillna(9)
 scan = scan.sort_values(["Prio","Score","ADX"], ascending=[True,False,False])
 
@@ -315,7 +336,7 @@ m[5].metric("Laufzeit",f"{time_module.time()-start:.1f}s")
 
 st.header("🔥 Top Market Radar")
 show = scan.head(top_n).copy()
-st.dataframe(show[["Gruppe","Asset","Ticker","Signal","Qualität","Score","15m Bias","5m Setup","3m Trigger","Entry Status","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","Markt","Grund"]]
+st.dataframe(show[["Gruppe","Asset","Ticker","Signal","Qualität","Score","15m Bias","5m Setup","3m Trigger","Entry Status","RSI Entry","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","Markt","Grund"]]
     .style.format({"EMA20 Dist. ATR":"{:.2f}","RSI":"{:.1f}","ADX":"{:.1f}","ATR %":"{:.2f}","CRV":"{:.2f}"}),
     use_container_width=True, hide_index=True)
 
@@ -347,7 +368,7 @@ if np.isfinite(r.Entry):
 ticker=r.Ticker
 left,middle,right=st.columns(3)
 with left:
-    st.subheader("3-Minuten Entry-Trigger")
+    st.subheader("3-Minuten Entry-Trigger" if r["3m Trigger"] != "FALLBACK" else "3m nicht verfügbar - 5m Fallback")
     st.line_chart(data3[ticker][["Close","EMA9","EMA20"]].tail(160))
 with middle:
     st.subheader("5-Minuten Setup")
@@ -357,7 +378,7 @@ with right:
     st.line_chart(data15[ticker][["Close","EMA20","EMA50","EMA200","VWAP"]].tail(160))
 
 st.caption(f"Letzte 3m-Kerze: {r['Timestamp 3m']} | Letzte 5m-Kerze: {r['Timestamp 5m']} | Letzte 15m-Kerze: {r['Timestamp 15m']}")
-st.warning("V4.1 Early nutzt 15m Bias, 5m Setup und 3m Trigger. EARLY und CONFIRMED sind nur technische Kandidaten; LATE ENTRY verlangt einen Pullback. KO-Level, Spread, Emittent, Bezugsverhältnis, Handelszeit und Event-Risiko vor einer manuellen Order prüfen.")
+st.warning("V4.1 Early nutzt 15m Bias, 5m Setup und 3m Trigger. RSI über 72 im LONG bzw. unter 28 im SHORT blockiert neue Einstiege. 3m-Fallback erlaubt kein EARLY-Signal. KO-Level, Spread, Emittent, Bezugsverhältnis, Handelszeit und Event-Risiko vor einer manuellen Order prüfen.")
 
 
 # ================================================================
