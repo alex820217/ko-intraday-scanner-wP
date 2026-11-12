@@ -13,7 +13,7 @@ from product_resolver import resolve_wkn, quote_age_minutes, freshness_label
 
 st.set_page_config(page_title="KO Market Radar V4.1 Early", page_icon="📡", layout="wide")
 st.title("📡 KO Market Radar V4.1 Early")
-st.caption("15m Bias + 5m Setup + 3m Entry-Trigger mit EARLY, CONFIRMED und LATE-ENTRY-Filter")
+st.caption("60m Regime + 15m Bias + 5m Setup + 3m Trigger, zweistufig und konfliktgefiltert")
 
 MIN_15M_BARS = 210
 MIN_5M_BARS = 60
@@ -179,25 +179,60 @@ def bias_15m(d):
     direction = "LONG" if long_count >= 4 and long_count > short_count else "SHORT" if short_count >= 4 and short_count > long_count else None
     return direction, long_checks, short_checks, long_count, short_count
 
+
+def regime_60m_from_15m(raw15):
+    """Build a closed 60m context from 15m candles without another market-data request."""
+    agg = {"Open":"first", "High":"max", "Low":"min", "Close":"last", "Volume":"sum"}
+    h1_raw = raw15.resample("60min", origin="start_day", label="right", closed="right").agg(agg).dropna()
+    if len(h1_raw) < 60:
+        return "NEUTRAL", {}, pd.DataFrame()
+    h1 = add_indicators(h1_raw.iloc[:-1]).dropna()
+    if len(h1) < 3:
+        return "NEUTRAL", {}, h1
+    r, p = h1.iloc[-1], h1.iloc[-2]
+    ema20_slope = float(r.EMA20 - p.EMA20)
+    long_checks = {
+        "60m Kurs > EMA20": r.Close > r.EMA20,
+        "60m EMA20 > EMA50": r.EMA20 > r.EMA50,
+        "60m EMA20 steigt": ema20_slope > 0,
+        "60m MACD nicht negativ": r.MACD_HIST >= 0,
+    }
+    short_checks = {
+        "60m Kurs < EMA20": r.Close < r.EMA20,
+        "60m EMA20 < EMA50": r.EMA20 < r.EMA50,
+        "60m EMA20 fällt": ema20_slope < 0,
+        "60m MACD nicht positiv": r.MACD_HIST <= 0,
+    }
+    lc = sum(bool(v) for v in long_checks.values())
+    sc = sum(bool(v) for v in short_checks.values())
+    regime = "LONG" if lc >= 3 and lc > sc else "SHORT" if sc >= 3 and sc > lc else "NEUTRAL"
+    return regime, (long_checks if regime == "LONG" else short_checks if regime == "SHORT" else {**long_checks, **short_checks}), h1
+
 def scan_asset(meta, spread_ok, event_risk, require_open):
     # Last row can still be forming, therefore only closed candles are evaluated.
     raw15 = download_one(meta["ticker"], "15m", "30d")
     raw5 = download_one(meta["ticker"], "5m", "5d")
-    raw3 = download_three_minute(meta["ticker"])
     d15 = add_indicators(raw15.iloc[:-1]).dropna()
     d5 = add_indicators(raw5.iloc[:-1]).dropna()
-    d3_candidate = add_indicators(raw3.iloc[:-1]).dropna() if not raw3.empty else pd.DataFrame()
     if len(d15) < MIN_15M_BARS or len(d5) < MIN_5M_BARS:
         raise ValueError(f"zu wenige Basisdaten (15m={len(d15)}, 5m={len(d5)})")
-    has_3m = len(d3_candidate) >= MIN_3M_BARS
-    # Fallback keeps the asset analyzable. It can produce WATCH/PRE and strict CONFIRMED,
-    # but never EARLY without a genuine 3m trigger.
-    d3 = d3_candidate if has_3m else d5.copy()
 
     old_long, old_short, old_lc, old_sc = score_15m(d15)
     bias, bias_lc, bias_sc, bias_long_count, bias_short_count = bias_15m(d15)
     preferred = bias or ("LONG" if old_long >= old_short else "SHORT")
     setup_checks, setup_count = setup_5m(d5, preferred)
+    regime60, regime_checks, d60 = regime_60m_from_15m(raw15)
+    context_aligned = regime60 == preferred or regime60 == "NEUTRAL"
+
+    # Stage 2: expensive 1m download is requested only for plausible candidates.
+    pre_candidate = bias is not None and setup_count >= 2 and context_aligned
+    if pre_candidate:
+        raw3 = download_three_minute(meta["ticker"])
+        d3_candidate = add_indicators(raw3.iloc[:-1]).dropna() if not raw3.empty else pd.DataFrame()
+    else:
+        d3_candidate = pd.DataFrame()
+    has_3m = len(d3_candidate) >= MIN_3M_BARS
+    d3 = d3_candidate if has_3m else d5.copy()
     if has_3m:
         trigger_checks, trigger_count = trigger_3m(d3, preferred)
     else:
@@ -232,6 +267,8 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
 
     if no_trade_reasons:
         signal, quality, reason, direction = "⛔ NO TRADE", "BLOCKED", "; ".join(no_trade_reasons), None
+    elif bias and regime60 != "NEUTRAL" and regime60 != preferred:
+        signal, quality, reason, direction = "⚠️ CONTEXT CONFLICT", "NO ENTRY", f"15m {preferred}, aber 60m-Regime {regime60}", None
     elif rsi_hot and bias and setup_count >= 3:
         signal, quality, reason, direction = "⛔ HOT ENTRY", "WAIT PULLBACK", f"RSI {rsi15:.1f} ist für einen neuen {preferred}-Einstieg überhitzt", preferred
     elif late_entry and bias and setup_count >= 3:
@@ -261,13 +298,13 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
         stop, t1, t2, ko = price + 1.2*atr, price - 2.16*atr, price - 3.36*atr, price + 1.7*atr
     else:
         stop=t1=t2=ko=np.nan
-    checks = {**(bias_lc if preferred == "LONG" else bias_sc), **setup_checks, **trigger_checks,
+    checks = {**regime_checks, **(bias_lc if preferred == "LONG" else bias_sc), **setup_checks, **trigger_checks,
               "Nicht zu spät": not late_entry, "RSI nicht überhitzt": not rsi_hot,
               "3m Daten verfügbar": has_3m, "Volatilität geeignet": volatility_ok}
     return {
         "Gruppe":meta["group"], "Asset":meta["name"], "Ticker":meta["ticker"],
         "Signal":signal, "Qualität":quality, "Score":score,
-        "Long":old_long, "Short":old_short, "15m Bias":bias or "NEUTRAL",
+        "Long":old_long, "Short":old_short, "60m Regime":regime60, "15m Bias":bias or "NEUTRAL",
         "5m Setup":f"{setup_count}/4", "3m Trigger":f"{trigger_count}/4" if has_3m else "FALLBACK",
         "Entry Status":entry_quality, "RSI Entry":rsi_entry_status, "EMA20 Dist. ATR":extension_atr,
         "Kurs":price, "RSI":float(r15.RSI), "ADX":float(r15.ADX), "ATR %":atr_pct,
@@ -324,7 +361,7 @@ if not rows:
     st.stop()
 
 scan = pd.DataFrame(rows)
-priority = {"🟢 EARLY LONG":0,"🔴 EARLY SHORT":0,"🟢🟢 CONFIRMED LONG":0,"🔴🔴 CONFIRMED SHORT":0,"🟠 PRE-LONG":1,"🟠 PRE-SHORT":1,"🟡 WATCH LONG":2,"🟡 WATCH SHORT":2,"⚪ WAIT":3,"⛔ HOT ENTRY":4,"⛔ LATE ENTRY":4,"⛔ NO TRADE":5}
+priority = {"🟢 EARLY LONG":0,"🔴 EARLY SHORT":0,"🟢🟢 CONFIRMED LONG":0,"🔴🔴 CONFIRMED SHORT":0,"🟠 PRE-LONG":1,"🟠 PRE-SHORT":1,"🟡 WATCH LONG":2,"🟡 WATCH SHORT":2,"⚠️ CONTEXT CONFLICT":3,"⚪ WAIT":3,"⛔ HOT ENTRY":4,"⛔ LATE ENTRY":4,"⛔ NO TRADE":5}
 scan["Prio"] = scan.Signal.map(priority).fillna(9)
 scan = scan.sort_values(["Prio","Score","ADX"], ascending=[True,False,False])
 
@@ -336,7 +373,7 @@ m[5].metric("Laufzeit",f"{time_module.time()-start:.1f}s")
 
 st.header("🔥 Top Market Radar")
 show = scan.head(top_n).copy()
-st.dataframe(show[["Gruppe","Asset","Ticker","Signal","Qualität","Score","15m Bias","5m Setup","3m Trigger","Entry Status","RSI Entry","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","Markt","Grund"]]
+st.dataframe(show[["Gruppe","Asset","Ticker","Signal","Qualität","Score","60m Regime","15m Bias","5m Setup","3m Trigger","Entry Status","RSI Entry","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","Markt","Grund"]]
     .style.format({"EMA20 Dist. ATR":"{:.2f}","RSI":"{:.1f}","ADX":"{:.1f}","ATR %":"{:.2f}","CRV":"{:.2f}"}),
     use_container_width=True, hide_index=True)
 
@@ -355,9 +392,9 @@ with st.expander(f"Nicht auswertbare Assets ({len(errors)})"):
 st.header("🔍 Setup-Details")
 selected = st.selectbox("Asset", scan.Asset.tolist())
 r = scan[scan.Asset == selected].iloc[0]
-c=st.columns(6)
+c=st.columns(7)
 c[0].metric("Signal",r.Signal); c[1].metric("Qualität",r.Qualität); c[2].metric("Score",int(r.Score))
-c[3].metric("15m Bias",r["15m Bias"]); c[4].metric("5m Setup",r["5m Setup"]); c[5].metric("3m Trigger",r["3m Trigger"])
+c[3].metric("60m Regime",r["60m Regime"]); c[4].metric("15m Bias",r["15m Bias"]); c[5].metric("5m Setup",r["5m Setup"]); c[6].metric("3m Trigger",r["3m Trigger"])
 st.info(r.Grund)
 st.dataframe(pd.DataFrame([{"Kriterium":k,"Status":"✅" if v else "❌"} for k,v in r.Checks.items()]), hide_index=True, use_container_width=True)
 if np.isfinite(r.Entry):
@@ -378,7 +415,7 @@ with right:
     st.line_chart(data15[ticker][["Close","EMA20","EMA50","EMA200","VWAP"]].tail(160))
 
 st.caption(f"Letzte 3m-Kerze: {r['Timestamp 3m']} | Letzte 5m-Kerze: {r['Timestamp 5m']} | Letzte 15m-Kerze: {r['Timestamp 15m']}")
-st.warning("V4.1 Early nutzt 15m Bias, 5m Setup und 3m Trigger. RSI über 72 im LONG bzw. unter 28 im SHORT blockiert neue Einstiege. 3m-Fallback erlaubt kein EARLY-Signal. KO-Level, Spread, Emittent, Bezugsverhältnis, Handelszeit und Event-Risiko vor einer manuellen Order prüfen.")
+st.warning("V4.1 Early nutzt 60m Regime, 15m Bias, 5m Setup und 3m Trigger. 1m-Daten werden nur für plausible Kandidaten geladen. RSI über 72 im LONG bzw. unter 28 im SHORT blockiert neue Einstiege. 3m-Fallback erlaubt kein EARLY-Signal. KO-Level, Spread, Emittent, Bezugsverhältnis, Handelszeit und Event-Risiko vor einer manuellen Order prüfen.")
 
 
 # ================================================================
