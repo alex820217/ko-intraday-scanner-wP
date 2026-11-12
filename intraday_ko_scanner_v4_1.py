@@ -15,6 +15,12 @@ from product_resolver import resolve_wkn, quote_age_minutes, freshness_label
 st.set_page_config(page_title="KO Market Radar V4.1 Early", page_icon="📡", layout="wide")
 st.title("📡 KO Market Radar V4.1 Early")
 st.caption("60m Regime + 15m Bias + 5m Setup + 3m Trigger, zweistufig und konfliktgefiltert")
+st.markdown("""<style>
+.block-container{max-width:1500px;padding-top:1.5rem;padding-bottom:3rem}
+[data-testid="stMetric"]{background:#fff;border:1px solid #e6eaf0;padding:14px 16px;border-radius:16px;box-shadow:0 5px 18px rgba(15,23,42,.05)}
+div[data-testid="stDataFrame"],[data-testid="stExpander"]{border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;box-shadow:0 4px 16px rgba(15,23,42,.04)}
+h1,h2,h3{letter-spacing:-.025em}.small-label{color:#64748b;font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.signal-box{padding:14px 16px;border-radius:14px;background:#f8fafc;border:1px solid #e2e8f0;margin:.4rem 0 1rem}.sc-box{padding:14px 16px;border-radius:14px;background:#eef6ff;border:1px solid #cfe4ff;margin:.5rem 0 1rem}
+</style>""",unsafe_allow_html=True)
 
 MIN_15M_BARS = 210
 MIN_5M_BARS = 60
@@ -336,7 +342,7 @@ def scan_asset(meta, spread_ok, event_risk, require_open):
     return {
         "Gruppe":meta["group"], "Asset":meta["name"], "Ticker":meta["ticker"],
         "Signal":signal, "Qualität":quality, "Score":score, "Setup Grade":setup_grade,
-        "Warum nicht A?":why_not_a, "Basiswert ISIN":underlying_isin, "SC Suche":sc_search,
+        "Setup-Hinweis":why_not_a, "Basiswert ISIN":underlying_isin, "SC Suche":sc_search,
         "Long":old_long, "Short":old_short, "60m Regime":regime60, "15m Bias":bias or "NEUTRAL",
         "5m Setup":f"{setup_count}/4", "3m Trigger":f"{trigger_count}/4" if has_3m else "FALLBACK",
         "Entry Status":entry_quality, "RSI Entry":rsi_entry_status, "EMA20 Dist. ATR":extension_atr,
@@ -407,12 +413,20 @@ m[4].metric("PRE/WATCH",int(scan.Signal.str.contains("PRE|WATCH", regex=True).su
 m[5].metric("Laufzeit",f"{time_module.time()-start:.1f}s")
 
 st.header("🔥 Top Market Radar")
-show = scan.head(top_n).copy()
-st.dataframe(show[["Gruppe","Asset","Ticker","Basiswert ISIN","Signal","Setup Grade","Warum nicht A?","Score","60m Regime","15m Bias","5m Setup","3m Trigger","Entry Status","RSI Entry","EMA20 Dist. ATR","RSI","ADX","ATR %","CRV","SC Suche","Markt","Grund"]]
-    .style.format({"EMA20 Dist. ATR":"{:.2f}","RSI":"{:.1f}","ADX":"{:.1f}","ATR %":"{:.2f}","CRV":"{:.2f}"}),
-    use_container_width=True, hide_index=True)
+show=scan.head(top_n).copy()
+compact_cols=["Asset","Signal","Setup Grade","Score","60m Regime","15m Bias","5m Setup","3m Trigger","Entry Status","Setup-Hinweis","SC Suche"]
+def _grade_bg(v): return {"A+":"background-color:#dcfce7;color:#087443;font-weight:750","A":"background-color:#e8f5e9;color:#16733a;font-weight:750","B":"background-color:#fef3c7;color:#8a6300;font-weight:750","C":"background-color:#ffedd5;color:#a64b00;font-weight:750","-":"color:#94a3b8"}.get(v,"")
+def _entry_bg(v):
+    v=str(v)
+    if "OPTIMAL" in v:return "background-color:#dcfce7;color:#137443;font-weight:650"
+    if "AKZEPTABEL" in v:return "background-color:#fef3c7;color:#8a6300;font-weight:650"
+    if "SPÄT" in v:return "background-color:#fee2e2;color:#b42318;font-weight:650"
+    return ""
+compact=show[compact_cols].copy();compact.index=range(1,len(compact)+1);compact.index.name="#"
+st.dataframe(compact.style.map(_grade_bg,subset=["Setup Grade"]).map(_entry_bg,subset=["Entry Status"]),use_container_width=True,height=min(720,42+36*len(compact)))
+st.caption("Ranking: Trade-Status → Grade → Score → ADX. RSI, ATR, CRV, ISIN und Kursdaten findest du in der Detailansicht.")
 
-with st.expander("Alle analysierten Assets"):
+with st.expander("📊 Alle technischen Daten anzeigen"):
     st.dataframe(scan.drop(columns=["Prio","GradeRank","Checks"]), use_container_width=True, hide_index=True)
 with st.expander(f"Geschlossene Märkte übersprungen ({len(skipped_closed)})"):
     if skipped_closed:
@@ -424,16 +438,18 @@ with st.expander(f"Nicht auswertbare Assets ({len(errors)})"):
     if errors: st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
     else: st.success("Keine Datenfehler.")
 
-st.header("🔍 Setup-Details")
+st.header("🎯 Setup-Details")
 selected = st.selectbox("Asset", scan.Asset.tolist())
 r = scan[scan.Asset == selected].iloc[0]
 c=st.columns(8)
 c[0].metric("Signal",r.Signal); c[1].metric("Setup Grade",r["Setup Grade"]); c[2].metric("Score",int(r.Score))
 c[3].metric("60m Regime",r["60m Regime"]); c[4].metric("15m Bias",r["15m Bias"]); c[5].metric("5m Setup",r["5m Setup"]); c[6].metric("3m Trigger",r["3m Trigger"]); c[7].metric("Entry",r["Entry Status"])
-st.caption(f"Warum nicht A?: {r['Warum nicht A?']} | Basiswert-ISIN: {r['Basiswert ISIN'] or '–'} | SC Suche: {r['SC Suche']}")
-st.info(r.Grund)
-st.dataframe(pd.DataFrame([{"Kriterium":k,"Status":"✅" if v else "❌"} for k,v in r.Checks.items()]), hide_index=True, use_container_width=True)
+st.markdown(f"""<div class="signal-box"><span class="small-label">Setup-Hinweis</span><br><b>{r['Setup-Hinweis']}</b><br><span style="color:#64748b">{r.Grund}</span></div>""",unsafe_allow_html=True)
+st.markdown(f"""<div class="sc-box"><span class="small-label">Scalable Capital Suche</span><br><span style="font-size:1.15rem;font-weight:750">{r['SC Suche']}</span><br><span style="color:#64748b">Basiswert-ISIN: {r['Basiswert ISIN'] or '–'} · Ticker: {r.Ticker}</span></div>""",unsafe_allow_html=True)
+with st.expander("Technische Kriterien anzeigen",expanded=False):
+    st.dataframe(pd.DataFrame([{"Kriterium":k,"Status":"✅" if v else "❌"} for k,v in r.Checks.items()]), hide_index=True, use_container_width=True)
 if np.isfinite(r.Entry):
+    st.subheader("💰 Trade-Level")
     levels=st.columns(6)
     for col,label in zip(levels,["Entry","Stop","Ziel 1","Ziel 2","CRV","KO Abstand %"]):
         col.metric(label,f"{r[label]:.4f}" if label not in {"CRV","KO Abstand %"} else f"{r[label]:.2f}")
@@ -441,13 +457,13 @@ if np.isfinite(r.Entry):
 ticker=r.Ticker
 left,middle,right=st.columns(3)
 with left:
-    st.subheader("3-Minuten Entry-Trigger" if r["3m Trigger"] != "FALLBACK" else "3m nicht verfügbar - 5m Fallback")
+    st.markdown("**3m · Entry Trigger**" if r["3m Trigger"] != "FALLBACK" else "**3m · 5m Fallback**")
     st.line_chart(data3[ticker][["Close","EMA9","EMA20"]].tail(160))
 with middle:
-    st.subheader("5-Minuten Setup")
+    st.markdown("**5m · Setup**")
     st.line_chart(data5[ticker][["Close","EMA9","EMA20","VWAP"]].tail(160))
 with right:
-    st.subheader("15-Minuten Bias")
+    st.markdown("**15m · Bias**")
     st.line_chart(data15[ticker][["Close","EMA20","EMA50","EMA200","VWAP"]].tail(160))
 
 st.caption(f"Letzte 3m-Kerze: {r['Timestamp 3m']} | Letzte 5m-Kerze: {r['Timestamp 5m']} | Letzte 15m-Kerze: {r['Timestamp 15m']}")
